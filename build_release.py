@@ -50,26 +50,65 @@ def default_version() -> str:
     return os.environ.get("BFUA_VERSION", "v1.0.0")
 
 
+# 我们只用 QtCore / QtGui / QtWidgets；显式排除其余 PySide6 模块，
+# 避免它们连同各自的 Qt 库一起被打包（PySide6 附带的大量模块是体积大头）。
+PYINSTALLER_EXCLUDES = [
+    # QML / Quick 全家桶
+    "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
+    "PySide6.QtQuickControls2", "PySide6.QtQuick3D", "PySide6.QtQuickLayouts",
+    # 用不到的 Qt 模块
+    "PySide6.QtNetwork", "PySide6.QtSvg", "PySide6.QtSql", "PySide6.QtTest",
+    "PySide6.QtXml", "PySide6.QtDBus", "PySide6.QtOpenGL",
+    "PySide6.QtOpenGLWidgets", "PySide6.QtPrintSupport", "PySide6.QtHelp",
+    "PySide6.QtUiTools", "PySide6.QtDesigner", "PySide6.QtScxml",
+    "PySide6.QtStateMachine", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
+    "PySide6.QtWebEngine", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
+    "PySide6.QtWebChannel", "PySide6.QtWebSockets", "PySide6.QtWebView",
+    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets", "PySide6.QtCharts",
+    "PySide6.QtDataVisualization", "PySide6.QtBluetooth", "PySide6.QtNfc",
+    "PySide6.QtPositioning", "PySide6.QtLocation", "PySide6.QtSensors",
+    "PySide6.QtSerialPort", "PySide6.QtTextToSpeech", "PySide6.QtNetworkAuth",
+    "PySide6.QtRemoteObjects", "PySide6.QtHttpServer", "PySide6.QtLanguageServer",
+    # Qt3D 全家桶
+    "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DInput",
+    "PySide6.Qt3DLogic", "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras",
+]
+
+
 def platform_opts() -> tuple:
     """Return (pyinstaller_extra_opts, artifact_name) for the host OS."""
     system = platform.system()
+    excludes = [flag for m in PYINSTALLER_EXCLUDES for flag in ("--exclude-module", m)]
+
     if system == "Windows":
-        return ["--onefile", "--noconsole", "--name", "BFUA"], "BFUA.exe"
+        return ["--onefile", "--noconsole", "--name", "BFUA"] + excludes, "BFUA.exe"
+
     if system == "Darwin":
         # macOS 用 --onedir 生成 .app 包：
         #  - --onefile 在 macOS 上需要先组装单文件 bootloader 再做 .app 包装，步骤慢，
         #    与 PySide6 的大量 Qt 框架一起在 CI 上容易长时间卡住（甚至半小时无输出）。
         #  - --onedir 直接生成 .app 包，构建快、首次启动也快，是 PySide6 macOS 的标准做法。
         #  - --codesign-identity=- 强制 ad-hoc 签名，避免 runner 上签名身份/钥匙串问题。
-        return [
+        #  - --target-architecture 只保留指定架构，可大幅瘦身（PySide6 的 dylib 是
+        #    universal2 双架构，默认两者都打进 .app）。可用 BFUA_ARCH=arm64|x86_64|universal 控制。
+        arch = os.environ.get("BFUA_ARCH", "universal").lower()
+        opts = [
             "--windowed",
             "--onedir",
             "--name", "BFUA",
             "--osx-bundle-identifier", "com.bfua.uploader",
             "--codesign-identity", "-",
-        ], "BFUA.app"
+        ] + excludes
+        if arch in ("arm64", "x86_64"):
+            opts += ["--target-architecture", arch]
+        elif arch != "universal":
+            sys.exit(f"Unsupported BFUA_ARCH: {arch} (use arm64 / x86_64 / universal)")
+        return opts, "BFUA.app"
+
     if system == "Linux":
-        return ["--onefile", "--noconsole", "--name", "BFUA"], "BFUA"
+        # --strip 剔除 .so 的调试符号，Linux 包通常能减小 15-30%。
+        return ["--onefile", "--noconsole", "--strip", "--name", "BFUA"] + excludes, "BFUA"
+
     sys.exit(f"Unsupported platform: {system}")
 
 
