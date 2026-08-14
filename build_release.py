@@ -22,12 +22,28 @@ Requires on the build machine:
 import argparse
 import os
 import platform
-import shutil
 import subprocess
 import sys
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SCRIPT = os.path.join(HERE, "bfua.py")
+
+
+def zip_artifact(zip_path: str, artifact: str) -> None:
+    """把单个构建产物打成 zip（只打包产物本身，避免把 Releases 目录里的其他文件带进去）。
+
+    artifact 可以是文件（BFUA.exe / BFUA），也可以是目录（macOS 的 BFUA.app）。
+    """
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(artifact):
+            for root, _dirs, files in os.walk(artifact):
+                for name in files:
+                    full = os.path.join(root, name)
+                    arc = os.path.relpath(full, os.path.dirname(artifact))
+                    zf.write(full, arc)
+        else:
+            zf.write(artifact, os.path.basename(artifact))
 
 
 def default_version() -> str:
@@ -40,11 +56,17 @@ def platform_opts() -> tuple:
     if system == "Windows":
         return ["--onefile", "--noconsole", "--name", "BFUA"], "BFUA.exe"
     if system == "Darwin":
+        # macOS 用 --onedir 生成 .app 包：
+        #  - --onefile 在 macOS 上需要先组装单文件 bootloader 再做 .app 包装，步骤慢，
+        #    与 PySide6 的大量 Qt 框架一起在 CI 上容易长时间卡住（甚至半小时无输出）。
+        #  - --onedir 直接生成 .app 包，构建快、首次启动也快，是 PySide6 macOS 的标准做法。
+        #  - --codesign-identity=- 强制 ad-hoc 签名，避免 runner 上签名身份/钥匙串问题。
         return [
-            "--onefile",
             "--windowed",
+            "--onedir",
             "--name", "BFUA",
             "--osx-bundle-identifier", "com.bfua.uploader",
+            "--codesign-identity", "-",
         ], "BFUA.app"
     if system == "Linux":
         return ["--onefile", "--noconsole", "--name", "BFUA"], "BFUA"
@@ -92,7 +114,7 @@ def main() -> int:
 
     if args.zip:
         zip_base = os.path.join(dist_dir, f"BFUA-{platform.system().lower()}")
-        shutil.make_archive(zip_base, "zip", dist_dir)
+        zip_artifact(f"{zip_base}.zip", artifact)
         print(f">>> OK: {zip_base}.zip")
 
     return 0

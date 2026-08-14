@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller build & spec
+build/
+*.spec
+
+# 发布产物（构建脚本 build_release.py 生成的二进制与压缩包）
+# 注意：Releases 下只需要保留最终 zip，单个二进制可忽略
+Releases/*/*.exe
+Releases/*/BFUA
+Releases/*/BFUA.app
+Releases/*/*.zip
+
+# 从 GitHub Actions 下载的产物（体积大，超过 GitHub 单文件 100MB 限制，不应入库）
+Final/
+
+# 截图 / 杂项
+*.png
