@@ -1,0 +1,70 @@
+name: Build BFUA (all platforms)
+
+# 在 GitHub 云端分别用原生系统构建 Windows / macOS / Linux 三个版本。
+# 用法：
+#   1. 把项目推送到 GitHub 仓库（workflow 会在 .github/workflows/ 下自动生效）
+#   2. 手动触发：Actions -> "Build BFUA (all platforms)" -> Run workflow
+#      或打 tag：git tag v1.0.0 && git push --tags
+#   3. 构建产物在 Actions 页面的 Artifacts 中下载；打 tag 时自动生成 GitHub Release
+#
+# 为什么需要 CI：PyInstaller 不能交叉编译，macOS 版必须在 macOS 上构建，
+# Linux 版必须在 Linux 上构建。本 workflow 用三种 runner 各自原生构建。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: macos-latest
+          - os: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build release package
+        run: python build_release.py --zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BFUA-${{ matrix.os }}
+          path: Releases/*/*.zip
+
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
