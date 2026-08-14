@@ -7,13 +7,14 @@ Run:
 """
 
 import os
+import platform
 import sys
 import threading
 
 import requests  # mwclient 的硬依赖
 
 from PySide6.QtCore import Qt, Signal, Slot, QObject, QRectF, QPointF
-from PySide6.QtGui import QColor, QPainter, QPen, QFont
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QDialog, QWidget, QLabel, QLineEdit, QPushButton,
     QHBoxLayout, QVBoxLayout, QFileDialog, QGraphicsDropShadowEffect, QProgressBar,
@@ -45,6 +46,38 @@ ERR_RED       = "#d70015"
 
 __version__ = "1.0.0"
 
+# 无边框窗口使用半透明+阴影来实现“毛玻璃”观感；但部分 Linux X11 会话没有
+# 窗口合成器，半透明背景会被渲染成整块透明/黑块，窗口直接不可见。
+# 因此 Linux 默认降级为“平面窗口”（不透明、无阴影）；若确认有合成器，
+# 可用环境变量 BFUA_TRANSLUCENT=1 重新启用毛玻璃效果。
+FLAT_WINDOW = platform.system() == "Linux" and os.environ.get("BFUA_TRANSLUCENT", "") != "1"
+
+
+# 批量上传的扩展名白名单：防止误把 .env、.pem、密钥/配置文件等敏感内容传上公网。
+# 命中白名单之外的扩展名，以及隐藏文件（. 开头）都会被跳过。
+ALLOWED_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".txt", ".md", ".csv", ".json", ".xml",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".mp3", ".ogg", ".wav", ".flac",
+    ".mp4", ".webm", ".mov", ".avi",
+    ".ttf", ".otf", ".woff", ".woff2",
+}
+
+# 即便扩展名合法也跳过的常见系统杂项文件
+SKIP_FILENAMES = {"thumbs.db", "desktop.ini", ".ds_store", "ehthumbs.db"}
+
+# 上传文件大小上限（默认 500MB），避免误选大文件导致长时间占用内存/连接
+MAX_FILE_SIZE = int(os.environ.get("BFUA_MAX_FILE_SIZE", str(500 * 1024 * 1024)))
+
+# 崩溃日志大小上限：超过则轮转为 <path>.old，防止无限增长占满磁盘
+CRASH_LOG_MAX_BYTES = 2 * 1024 * 1024  # 2MB
+
+# 崩溃钩子只安装一次（防重复安装时 faulthandler 文件句柄泄漏）
+_CRASH_HOOKS_INSTALLED = False
+_FAULTHANDLER_FILE = None
+
 
 # BWiki/mwclient
 
@@ -54,14 +87,19 @@ def make_site(sessdata: str) -> "MwSite":
     注意：mwclient 默认 max_retries=25 / retry_timeout=30，服务器一旦返回 5xx
     （例如 Wonderia 偶发的 567/500），重试等待累计可达数十分钟甚至更久，界面会
     长时间“毫无反应”。这里把重试次数与超时收紧，让失败尽快反馈给用户。
+
+    allow_redirects=False：只与指定 host 通信，拒绝任何重定向（防被引到别的站点）。
+    timeout 可通过环境变量 BFUA_TIMEOUT 调整（秒，默认 60），大文件上传可酌情调大。
     """
     if MwSite is None:
         raise RuntimeError("缺少依赖 mwclient，请先安装：pip install mwclient")
+    timeout = int(os.environ.get("BFUA_TIMEOUT", "60"))
+    allow_redirects = os.environ.get("BFUA_ALLOW_REDIRECTS", "0") == "1"
     site = MwSite(
         WIKI_HOST, path=WIKI_PATH, scheme="https",
         max_retries=2,          # 5xx/网络错误最多重试 2 次
         retry_timeout=4,        # 每次重试前的等待秒数
-        connection_options={"timeout": 20},  # 单次 HTTP 请求超时 20 秒
+        connection_options={"timeout": timeout, "allow_redirects": allow_redirects},
     )
     site.connection.headers["User-Agent"] = USER_AGENT
     if sessdata:
@@ -82,8 +120,14 @@ def _friendly_error(exc: Exception) -> str:
         code = exc.response.status_code if exc.response is not None else "?"
         return f"服务器返回错误（HTTP {code}），服务器可能暂时繁忙，请稍后重试。"
     if isinstance(exc, OSError):
-        return f"本地文件系统错误：{exc}"
-    msg = str(exc)
+        try:
+            return f"本地文件系统错误：{exc}"
+        except Exception:  # noqa: BLE001 - str() 极罕见地自身抛异常
+            return "本地文件系统错误。"
+    try:
+        msg = str(exc)
+    except Exception:  # noqa: BLE001
+        msg = ""
     return msg if msg else type(exc).__name__
 
 
@@ -125,7 +169,15 @@ def _parse_upload_response(response, filename: str) -> dict:
     之前代码直接忽略返回值，导致这些场景一律显示“上传成功”，但文件实际并没有
     出现在 wiki 上（管理员反馈的正是这个现象）。这里必须检查 result。
     """
-    upload = (response or {}).get("upload") or {}
+    # 健壮性：响应应始终是 dict，但防御性处理非 dict / None 的情况
+    payload = response if isinstance(response, dict) else {}
+    # 关键：mwclient 的 Site.upload() 对普通上传返回的是已经解包后的 upload 子结构
+    # （{"result": "Success", "filename": ...}），并不是完整 API 响应；分块上传
+    # （大文件）最终返回的才是完整响应 {"upload": {...}}。
+    # 因此若响应里没有 "upload" 键，就应直接把响应本身当作 upload 结构；
+    # 否则会得到空字典，导致“上传成功”被误判为“服务器未返回上传结果”。
+    inner = payload.get("upload")
+    upload = inner if isinstance(inner, dict) else payload
     result = str(upload.get("result", "") or "")
 
     # 审核队列：无论以异常（moderation-image-queued）还是以 Warning 返回，
@@ -152,6 +204,10 @@ def _parse_upload_response(response, filename: str) -> dict:
             parts.append(f"{err.get('code', '')}: {err.get('info', '')}")
         else:
             parts.append(str(err))
+    # 分块上传若只返回 filekey（未完成正式发布），说明文件仅暂存、尚未保存
+    filekey = upload.get("filekey") or upload.get("sessionkey")
+    if filekey:
+        parts.append(f"filekey={filekey}（文件仅暂存，尚未正式发布）")
     detail = "；".join(p for p in parts if p)
     return {"status": "error", "filename": filename, "detail": detail}
 
@@ -171,6 +227,9 @@ def upload_single(sessdata: str, file_path: str, description: str, comment: str)
     site = make_site(sessdata)
     filename = os.path.basename(file_path)
     try:
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_SIZE:
+            raise RuntimeError(f"文件过大（{size / 1024 / 1024:.1f} MB），超过上传上限。")
         with open(file_path, "rb") as f:
             response = site.upload(f, filename=filename,
                                    description=description or "",
@@ -191,50 +250,79 @@ def upload_batch(sessdata: str, folder_path: str, description: str, comment: str
     status 为 "init"（开始连接/扫描）、"uploading"（正在上传该文件）、
     "ok"（成功）、"queued"（已提交审核）或 "error"（失败）。
     """
-    if on_progress:
-        on_progress(0, 0, "", "init", "")
     site = make_site(sessdata)
     try:
-        files = sorted(
+        all_files = sorted(
             name for name in os.listdir(folder_path)
             if os.path.isfile(os.path.join(folder_path, name))
         )
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"无法读取文件夹：{_friendly_error(exc)}")
+    # 只上传白名单内的扩展名，并跳过隐藏文件与系统杂项，防止敏感文件被误传。
+    files = [
+        name for name in all_files
+        if not name.startswith(".")
+        and name.lower() not in SKIP_FILENAMES
+        and os.path.splitext(name)[1].lower() in ALLOWED_EXT
+    ]
+    skipped = len(all_files) - len(files)
     if not files:
-        raise RuntimeError("该文件夹中没有可上传的文件。")
+        raise RuntimeError("该文件夹中没有可上传的文件（已排除隐藏文件与不支持的类型）。")
+    if on_progress:
+        # 把被跳过的文件名列出来，避免用户疑惑“为什么这个文件没上传”
+        parts = []
+        if skipped:
+            fset = set(files)
+            skipped_names = [n for n in all_files if n not in fset]
+            shown = skipped_names[:8]
+            more = f" 等 {skipped} 个" if skipped > 8 else ""
+            parts.append(f"已跳过：{'、'.join(shown)}{more}")
+        on_progress(0, 0, "", "init", "；".join(parts))
     ok = queued = failed = 0
+
+    def _finish(name, status, detail=""):
+        nonlocal ok, queued, failed
+        if status == "ok":
+            ok += 1
+        elif status == "queued":
+            queued += 1
+        else:
+            failed += 1
+        if on_progress:
+            on_progress(i, len(files), name, status, detail)
+
     for i, name in enumerate(files, 1):
         if on_progress:
             on_progress(i, len(files), name, "uploading", "")
+        file_path = os.path.join(folder_path, name)
         try:
-            with open(os.path.join(folder_path, name), "rb") as f:
+            size = os.path.getsize(file_path)
+            if size > MAX_FILE_SIZE:
+                _finish(name, "error", f"文件过大（{size / 1024 / 1024:.1f} MB），超过上传上限。")
+                continue
+            with open(file_path, "rb") as f:
                 response = site.upload(f, filename=name,
                                        description=description or "",
                                        comment=comment or "")
             res = _parse_upload_response(response, name)
-            if res["status"] == "ok":
-                ok += 1
-                if on_progress:
-                    on_progress(i, len(files), name, "ok", "")
-            elif res["status"] == "queued":
-                queued += 1
-                if on_progress:
-                    on_progress(i, len(files), name, "queued", res["detail"])
-            else:
-                failed += 1
-                if on_progress:
-                    on_progress(i, len(files), name, "error", res["detail"])
+            _finish(name, res["status"], res["detail"])
+        except requests.exceptions.ConnectionError:
+            # 连接中断：重建 Site 重试一次，避免整批因单个断连而连锁失败
+            try:
+                site = make_site(sessdata)
+                with open(file_path, "rb") as f:
+                    response = site.upload(f, filename=name,
+                                           description=description or "",
+                                           comment=comment or "")
+                res = _parse_upload_response(response, name)
+                _finish(name, res["status"], res["detail"])
+            except Exception as exc:  # noqa: BLE001 — 重试仍失败则计入失败
+                _finish(name, "error", _friendly_error(exc))
         except Exception as exc:  # noqa: BLE001 — 单个文件失败不中断整批
             if _is_moderation_queue(exc):
-                queued += 1
-                if on_progress:
-                    detail = getattr(exc, "info", "") or str(exc)
-                    on_progress(i, len(files), name, "queued", detail)
+                _finish(name, "queued", getattr(exc, "info", "") or str(exc))
             else:
-                failed += 1
-                if on_progress:
-                    on_progress(i, len(files), name, "error", _friendly_error(exc))
+                _finish(name, "error", _friendly_error(exc))
     return ok, queued, failed, len(files)
 
 
@@ -365,7 +453,7 @@ class TaskWorker(QObject):
             self.done.emit((False, _friendly_error(exc)))
 
 
-def spawn_worker(parent, fn, callback, *args) -> threading.Thread:
+def spawn_worker(fn, callback, *args) -> threading.Thread:
     """在独立 Python 线程中执行 fn，完成后通过 done 信号回到主线程。
 
     返回的线程对象由调用方持有引用（self._threads），避免被 GC。
@@ -502,12 +590,19 @@ class TitleBar(QWidget):
 # 无边框窗口基类
 
 def _apply_surface(window, dialog_mode: bool, title: str):
-    """初始化窗口：无边框 + 圆角 + 阴影 + 标题栏 + body 区域。"""
-    window.setAttribute(Qt.WA_TranslucentBackground)
+    """初始化窗口：无边框 + 圆角 + 阴影 + 标题栏 + body 区域。
+
+    在 FLAT_WINDOW（Linux 无合成器降级）下关闭半透明与阴影，并去掉透明边距，
+    保证窗口可见、可正常使用。
+    """
+    if not FLAT_WINDOW:
+        window.setAttribute(Qt.WA_TranslucentBackground)
+
+    margin = 0 if FLAT_WINDOW else 36
 
     container = QWidget(window)
     container_lay = QVBoxLayout(container)
-    container_lay.setContentsMargins(36, 36, 36, 36)
+    container_lay.setContentsMargins(margin, margin, margin, margin)
     container_lay.setSpacing(0)
 
     root = QWidget(container)
@@ -515,11 +610,14 @@ def _apply_surface(window, dialog_mode: bool, title: str):
     root.setAttribute(Qt.WA_StyledBackground, True)
     container_lay.addWidget(root)
 
-    shadow = QGraphicsDropShadowEffect(root)
-    shadow.setBlurRadius(48)
-    shadow.setOffset(0, 8)
-    shadow.setColor(QColor(0, 0, 0, 110))
-    root.setGraphicsEffect(shadow)
+    if FLAT_WINDOW:
+        shadow = None
+    else:
+        shadow = QGraphicsDropShadowEffect(root)
+        shadow.setBlurRadius(48)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(0, 0, 0, 110))
+        root.setGraphicsEffect(shadow)
 
     root_lay = QVBoxLayout(root)
     root_lay.setContentsMargins(0, 0, 0, 0)
@@ -536,7 +634,7 @@ def _apply_surface(window, dialog_mode: bool, title: str):
     window._surface_shadow = shadow
     window._surface_titlebar = titlebar
     window._surface_body = body
-    window._surface_margin = 36
+    window._surface_margin = margin
 
     if isinstance(window, QMainWindow):
         window.setCentralWidget(container)
@@ -561,7 +659,8 @@ class FramelessWindow(QMainWindow):
         margin = 0 if maximized else self._surface_margin
         lay = self._surface_container.layout()
         lay.setContentsMargins(margin, margin, margin, margin)
-        self._surface_shadow.setEnabled(not maximized)
+        if self._surface_shadow is not None:
+            self._surface_shadow.setEnabled(not maximized)
 
     def body_layout(self):
         return self._surface_body.layout()
@@ -599,8 +698,10 @@ class MainWindow(FramelessWindow):
     def __init__(self):
         super().__init__("BFUA — Bwiki File Upload Assistant")
         self._threads = []
+        self._closing = False  # 关闭中：异步回调一律忽略，防止访问已销毁的 Qt 对象
         self.sessdata = ""
         self.validated = False
+        self._pending_sess = ""  # 点击 Confirm 时正在验证的那个值
 
         self.setFixedSize(620, 368)
 
@@ -614,10 +715,10 @@ class MainWindow(FramelessWindow):
         self.welcome.setAlignment(Qt.AlignCenter)
         body.addWidget(self.welcome)
 
-        # ---- 第 2 行：设置你的 SSESDATA / 输入框 / Confirm ----
+        # ---- 第 2 行：设置你的 SESSDATA / 输入框 / Confirm ----
         row2 = QHBoxLayout()
         row2.setSpacing(10)
-        self.sess_label = QLabel("设置你的 SSESDATA: ")
+        self.sess_label = QLabel("设置你的 SESSDATA: ")
         self.sess_label.setObjectName("FieldLabel")
         self.sess_input = QLineEdit()
         self.sess_input.setPlaceholderText("粘贴你的 SESSDATA Cookie 值")
@@ -669,9 +770,14 @@ class MainWindow(FramelessWindow):
         self.single_btn.setEnabled(enabled)
         self.many_btn.setEnabled(enabled)
 
+    def _cleanup_threads(self):
+        self._threads = [t for t in self._threads if t.is_alive()]
+
     # ---- SESSDATA 验证 ----
     @Slot()
     def _on_sess_changed(self, text: str):
+        if self._closing:
+            return
         if self.validated and text != self.sessdata:
             self.validated = False
             self._set_upload_enabled(False)
@@ -679,24 +785,42 @@ class MainWindow(FramelessWindow):
 
     @Slot()
     def _on_confirm(self):
+        if self._closing:
+            return
+        # 验证进行中（按钮被禁用）时，输入框按 Enter 也会触发本方法；
+        # 必须拦截，否则会在上一轮验证返回前提交新值，产生“新值未经验证却被启用”的竞态。
+        if not self.confirm_btn.isEnabled():
+            return
+        self._cleanup_threads()
         sess = self.sess_input.text().strip()
         if not sess:
             self._set_feedback("请先填入你的 SESSDATA。", error=True)
             return
+        self._pending_sess = sess
         self.confirm_btn.setEnabled(False)
         self.confirm_btn.setText("验证中…")
         self._set_feedback("正在验证 SESSDATA…")
         self._threads.append(
-            spawn_worker(self, validate_sessdata, self._on_validate_done, sess)
+            spawn_worker(validate_sessdata, self._on_validate_done, sess)
         )
 
     @Slot(object)
     def _on_validate_done(self, payload):
+        if self._closing:
+            return
         self.confirm_btn.setEnabled(True)
-        self.confirm_btn.setText("Confirm")
+        self.confirm_btn.setText("确认")
+        self._cleanup_threads()
         ok, result = payload
+        current = self.sess_input.text().strip()
+        if ok and current != self._pending_sess:
+            # 验证期间用户修改了输入框：这次通过的是旧值，不能用新值继续上传
+            self.validated = False
+            self._set_upload_enabled(False)
+            self._set_feedback("SESSDATA 在验证过程中被修改，请重新点击确认。", error=True)
+            return
         if ok:
-            self.sessdata = self.sess_input.text().strip()
+            self.sessdata = current
             self.validated = True
             self._set_upload_enabled(True)
             name, groups = result
@@ -706,6 +830,24 @@ class MainWindow(FramelessWindow):
             self.validated = False
             self._set_upload_enabled(False)
             self._set_feedback(f"不恭喜，验证失败！  {result}", error=True)
+
+    def closeEvent(self, event):
+        self._closing = True
+        # 若系统剪贴板里正好是 SESSDATA（用户粘贴后未复制其他内容），一并清除，
+        # 防止 Cookie 残留在剪贴板中
+        try:
+            cb = QApplication.clipboard()
+            val = self.sess_input.text().strip() or self.sessdata
+            if val and cb.text() == val:
+                cb.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        # 关闭主窗口时清空内存中的 SESSDATA，避免 Cookie 长期驻留
+        self.sess_input.clear()
+        self.sessdata = ""
+        self._pending_sess = ""
+        self._threads = []
+        super().closeEvent(event)
 
     # ---- 打开上传窗口 ----
     def _open_upload(self, mode: str):
@@ -731,6 +873,7 @@ class UploadDialog(FramelessDialog):
         self.sessdata = sessdata
         self._threads = []
         self._busy = False
+        self._closing = False  # 关闭中：异步回调一律忽略，防止访问已销毁的 Qt 对象
 
         self.resize(600, 400 if is_batch else 340)
 
@@ -828,11 +971,15 @@ class UploadDialog(FramelessDialog):
         if path:
             self.path_input.setText(path)
 
+    def _cleanup_threads(self):
+        self._threads = [t for t in self._threads if t.is_alive()]
+
     # ---- 开始上传 ----
     @Slot()
     def _start(self):
-        if self._busy:
+        if self._closing or self._busy:
             return
+        self._cleanup_threads()
         path = self.path_input.text().strip()
         if not path:
             self._set_status("请先填写文件/文件夹路径。", error=True)
@@ -854,21 +1001,24 @@ class UploadDialog(FramelessDialog):
         if self.mode == "single":
             self._set_status("正在上传…")
             self._threads.append(
-                spawn_worker(self, upload_single, self._on_single_done,
+                spawn_worker(upload_single, self._on_single_done,
                              self.sessdata, path, desc, cmt)
             )
         else:
             self._set_status("正在批量上传…")
             self._threads.append(
-                spawn_worker(self, upload_batch, self._on_batch_done,
+                spawn_worker(upload_batch, self._on_batch_done,
                              self.sessdata, path, desc, cmt,
                              lambda i, t, n, s, d: self.progress_signal.emit(i, t, n, s, d))
             )
 
     @Slot(int, int, str, str, str)
     def _on_progress(self, i, total, name, status, detail):
+        if self._closing:
+            return
         if status == "init":
-            self._set_status("正在连接 wiki 并扫描文件夹…")
+            self.progress_bar.setValue(0)
+            self._set_status(detail or "正在连接 wiki 并扫描文件夹…")
             return
         if total:
             self.progress_bar.setValue(int(i / total * 100))
@@ -883,7 +1033,10 @@ class UploadDialog(FramelessDialog):
 
     @Slot(object)
     def _on_single_done(self, payload):
+        if self._closing:
+            return
         self._set_busy(False)
+        self._cleanup_threads()
         ok, result = payload
         if ok:
             status = result.get("status")
@@ -903,7 +1056,10 @@ class UploadDialog(FramelessDialog):
 
     @Slot(object)
     def _on_batch_done(self, payload):
+        if self._closing:
+            return
         self._set_busy(False)
+        self._cleanup_threads()
         ok, result = payload
         if ok:
             done, queued, failed, total = result
@@ -918,12 +1074,98 @@ class UploadDialog(FramelessDialog):
             self._set_status("正在上传中，请等待完成后再关闭窗口。", error=True)
             event.ignore()
         else:
+            self._closing = True
+            # 断开进度信号，防止仍可能执行的回调触碰正在销毁的 UI
+            try:
+                self.progress_signal.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            # 对话框关闭时清空其中的 SESSDATA 副本，减少内存驻留
+            self.sessdata = ""
+            self._threads = []
             super().closeEvent(event)
 
 
 # 入口
 
+_COOKIE_RE = None  # 惰性初始化（import re 在函数内）
+
+def _redact_log_text(text: str) -> str:
+    """把日志文本中的 SESSDATA / Cookie 值脱敏，防止凭证明文落盘。"""
+    global _COOKIE_RE
+    import re
+    if _COOKIE_RE is None:
+        _COOKIE_RE = re.compile(r"(SESSDATA|cookie)\s*=\s*[^\s&;\"']+", re.IGNORECASE)
+    return _COOKIE_RE.sub(lambda m: m.group(1) + "=***", text)
+
+
+def _install_crash_hooks():
+    """安装全局异常钩子：未捕获异常写入日志，便于无控制台版本排查启动崩溃。
+
+    只安装一次；日志会先做 Cookie 脱敏并限制大小，避免泄露 SESSDATA 或占满磁盘。
+    """
+    global _CRASH_HOOKS_INSTALLED, _FAULTHANDLER_FILE
+    import faulthandler
+    import traceback
+
+    if _CRASH_HOOKS_INSTALLED:
+        return
+    _CRASH_HOOKS_INSTALLED = True
+
+    log_path = os.path.join(os.path.expanduser("~"), "BFUA_crash.log")
+
+    # 日志大小轮转：超过上限则把旧日志改名为 .old（覆盖旧的 .old）
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > CRASH_LOG_MAX_BYTES:
+            os.replace(log_path, log_path + ".old")
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _write_log(header: str, text: str):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(header)
+                f.write(_redact_log_text(text))
+        except Exception:  # noqa: BLE001 - 日志本身失败不能影响运行
+            pass
+
+    # faulthandler 默认把崩溃栈写到 stderr，而无控制台构建里 stderr 是被丢弃的，
+    # 因此必须显式把输出指到日志文件。把文件句柄保存到模块级变量，防止被 GC 且可复用。
+    try:
+        fh = open(log_path, "a", encoding="utf-8")
+        _FAULTHANDLER_FILE = fh
+        faulthandler.enable(file=fh)
+    except Exception:  # noqa: BLE001 - 日志初始化失败不能影响程序启动
+        pass
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        import io
+        buf = io.StringIO()
+        traceback.print_exception(exc_type, exc_value, exc_tb, file=buf)
+        _write_log("\n===== BFUA unhandled exception =====\n", buf.getvalue())
+
+    sys.excepthook = _excepthook
+
+    # Qt 槽函数内部抛出的异常有时走的是 unraisable 路径而不是 excepthook
+    def _unraisablehook(unraisable):
+        parts = []
+        if unraisable.exc_value is not None:
+            import io
+            buf = io.StringIO()
+            traceback.print_exception(unraisable.exc_type, unraisable.exc_value,
+                                      unraisable.exc_traceback, file=buf)
+            parts.append(buf.getvalue())
+        try:
+            parts.append(f"object: {unraisable.object!r}\n")
+        except Exception:  # noqa: BLE001
+            pass
+        _write_log("\n===== BFUA unraisable exception =====\n", "".join(parts))
+
+    sys.unraisablehook = _unraisablehook
+
+
 def main():
+    _install_crash_hooks()
     app = QApplication(sys.argv)
     app.setApplicationName("BFUA")
     app.setApplicationDisplayName("BFUA — Bwiki File Upload Assistant")

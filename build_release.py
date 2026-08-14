@@ -16,18 +16,22 @@ Usage:
     python build_release.py --help
 
 Requires on the build machine:
-    pip install -r requirements.txt pyinstaller
+    pip install -r requirements.txt "pyinstaller>=6.10"
 """
 
 import argparse
 import os
 import platform
+import re
 import subprocess
 import sys
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SCRIPT = os.path.join(HERE, "bfua.py")
+
+# 版本号白名单：仅允许字母数字及 . _ + -，防止 --version ../../evil 之类路径穿越
+VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 
 
 def zip_artifact(zip_path: str, artifact: str) -> None:
@@ -40,7 +44,8 @@ def zip_artifact(zip_path: str, artifact: str) -> None:
             for root, _dirs, files in os.walk(artifact):
                 for name in files:
                     full = os.path.join(root, name)
-                    arc = os.path.relpath(full, os.path.dirname(artifact))
+                    # 统一用正斜杠，避免 Windows 上 zip 内出现反斜杠路径
+                    arc = os.path.relpath(full, os.path.dirname(artifact)).replace(os.sep, "/")
                     zf.write(full, arc)
         else:
             zf.write(artifact, os.path.basename(artifact))
@@ -125,6 +130,17 @@ def main() -> int:
     if not os.path.isfile(APP_SCRIPT):
         sys.exit(f"Not found: {APP_SCRIPT} (run this from the project root)")
 
+    # 校验版本号，防止 --version ../../evil 之类路径穿越
+    if not VERSION_RE.match(args.version):
+        sys.exit(f"非法版本号：{args.version!r}（仅允许字母、数字、. _ + -）")
+
+    # 提前检查 PyInstaller 是否安装，给出友好提示
+    # （Python 3.13/3.14 需要较新的 PyInstaller 才支持，故提示固定最低版本）
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        sys.exit("未安装 PyInstaller，请先运行：pip install \"pyinstaller>=6.10\"")
+
     version = args.version.lstrip("v") if args.version.startswith("v") else args.version
     dist_dir = os.path.join(HERE, "Releases", f"v{version}")
     work_dir = os.path.join(HERE, "build", "pyinstaller")
@@ -150,6 +166,14 @@ def main() -> int:
         return 1
 
     print(f"\n>>> OK: {artifact}")
+
+    # 签名 / 安全提示：ad-hoc 与无签名的产物会被系统拦截，提醒发布者准备说明
+    if platform.system() == "Darwin":
+        print(">>> 提示：macOS 产物使用 ad-hoc 签名，用户首次运行需在"
+              "「系统设置 > 隐私与安全性」中允许打开，或用正式开发者证书签名。")
+    elif platform.system() == "Windows":
+        print(">>> 提示：Windows 产物未签名，SmartScreen 可能提示未知发布者；"
+              "分发时请在 README 中说明，或使用正式代码签名证书。")
 
     if args.zip:
         zip_base = os.path.join(dist_dir, f"BFUA-{platform.system().lower()}")
