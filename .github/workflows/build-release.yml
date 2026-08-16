@@ -39,7 +39,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt "pyinstaller>=6.10"
+        run: pip install -r requirements.txt "pyinstaller==6.22.0"
 
       - name: Build release package
         run: python build_release.py --zip

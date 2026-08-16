@@ -16,7 +16,7 @@ Usage:
     python build_release.py --help
 
 Requires on the build machine:
-    pip install -r requirements.txt "pyinstaller>=6.10"
+    pip install -r requirements.txt "pyinstaller==6.22.0"
 """
 
 import argparse
@@ -25,6 +25,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -139,7 +140,7 @@ def main() -> int:
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
-        sys.exit("未安装 PyInstaller，请先运行：pip install \"pyinstaller>=6.10\"")
+        sys.exit("未安装 PyInstaller，请先运行：pip install \"pyinstaller==6.22.0\"")
 
     version = args.version.lstrip("v") if args.version.startswith("v") else args.version
     dist_dir = os.path.join(HERE, "Releases", f"v{version}")
@@ -154,8 +155,21 @@ def main() -> int:
     cmd += ["--distpath", dist_dir, "--workpath", work_dir,
             "--specpath", work_dir] + opts + [APP_SCRIPT]
 
+    # Windows 上 PyInstaller 的 EXE 资源写入阶段（EndUpdateResource）偶发遇到
+    # 文件被短暂占用（WinError 64，通常是 Defender/杀软扫描刚复制的 EXE），
+    # 表现为一次性构建失败。CI 里更容易碰到：这里在失败时自动重试一次（用 --clean），
+    # 提高稳定性；其余平台与重试仍失败的情况直接报错。
     print(">>> Running:", " ".join(cmd))
-    subprocess.check_call(cmd)
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        if platform.system() != "Windows" or "--clean" in cmd:
+            raise
+        print(">>> Windows 构建首次尝试失败（可能是偶发文件占用），自动重试一次…")
+        time.sleep(5)
+        retry_cmd = [sys.executable, "-m", "PyInstaller", "--clean"] + [
+            a for a in cmd[3:] if a != "--clean"]
+        subprocess.check_call(retry_cmd)
 
     artifact = os.path.join(dist_dir, artifact_name)
     if not os.path.exists(artifact):
