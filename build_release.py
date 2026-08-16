@@ -118,7 +118,24 @@ def platform_opts() -> tuple:
     sys.exit(f"Unsupported platform: {system}")
 
 
+def _force_utf8_stdio() -> None:
+    """强制 stdout/stderr 使用 UTF-8 输出。
+
+    GitHub Actions 的 Windows runner 是 en-US 环境，stdout 编码为 cp1252，
+    无法编码中文字符；本脚本有中文打印（签名提示、错误信息等），在 CI 上会
+    因 UnicodeEncodeError 崩溃（构建本身成功但脚本非零退出）。这里强制 UTF-8
+    并启用 errors=replace 兜底，本地与 CI 均不受控制台编码影响。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 某些环境不支持 reconfigure，忽略
+            pass
+
+
 def main() -> int:
+    _force_utf8_stdio()
+
     ap = argparse.ArgumentParser(description="Build BFUA for the host OS.")
     ap.add_argument("--version", default=default_version(),
                     help="Output subfolder under Releases/ (default: v1.0.0)")
